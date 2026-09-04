@@ -32,6 +32,25 @@ failure in `errors` for the other rather than raising, and `report()` names
 the exact module each successful patch came from so this ambiguity cannot
 recur silently.
 
+The identical split exists one level deeper, for speculation itself. V1's
+proposers live under `vllm.v1.spec_decode` (`NgramProposer`,
+`SpecDecodeBaseProposer`, `EagleProposer`, ...). V2's model runner does NOT
+use those -- it has its own, separately-named `Speculator` hierarchy under
+`vllm.v1.worker.gpu.spec_decode` (`BaseSpeculator` -> `DraftModelSpeculator`
+-> `AutoRegressiveSpeculator` -> `EagleSpeculator`/`MTPSpeculator`/
+`Gemma4Speculator`, plus `DFlashSpeculator` -> `DFlash2Speculator`/
+`DSparkSpeculator`, plus `MultiModuleMTPSpeculator`). Patching only the V1
+proposers left DRAFT permanently at zero on any run that took the V2 path --
+`report()` said "patched" while the class that actually drafted tokens was
+never touched, exactly the same failure mode as the runner split above, one
+layer down. `use_v2_model_runner` selects the model-runner hierarchy; it
+does not separately select the speculator hierarchy, but in practice the two
+travel together, so both proposer *and* speculator families are patched
+unconditionally below regardless of which runner is active. Any future
+instrumentation target in this codebase must be checked against BOTH the V1
+and V2 sides before being declared covered -- this is the second time the
+same trap has fired.
+
 No existing vLLM source file is modified; everything here is monkeypatching
 applied from the `vllm.general_plugins` entry point (see register() below).
 """
@@ -55,11 +74,36 @@ _MODEL_RUNNER_TARGETS = (
     ("vllm.v1.worker.gpu.model_runner", "GPUModelRunner"),   # V2
 )
 
-# Proposer classes that expose a `propose()` method to wrap with DRAFT.
+# Proposer/Speculator classes that expose a `propose()` method to wrap with
+# DRAFT. Each entry MUST define propose() itself in its own __dict__ -- not
+# merely inherit it -- so that the labels below always name the class that
+# actually carries the implementation being patched, and so a subclass that
+# *overrides* propose() (escaping the base-class patch) is never silently
+# missed. Only base classes that do NOT override propose() are omitted,
+# because the corresponding _patch_method() call would be a no-op covered
+# by their base's entry.
+#
+# --- V1 (vllm.v1.spec_decode) ---
 # SpecDecodeBaseProposer is the shared base for the LLM-based drafters
 # (EAGLE/MTP, incl. Nemotron); subclasses that do not override propose()
 # inherit the wrapped implementation for free. Step3p5MTPProposer overrides
 # propose() itself, so it needs its own entry.
+#
+# --- V2 (vllm.v1.worker.gpu.spec_decode) ---
+# BaseSpeculator.propose is @abstractmethod (no implementation to wrap) --
+# deliberately NOT listed here; do not re-add it.
+# DraftModelSpeculator does not override propose() either (still abstract
+# at that level) -- also not listed.
+# AutoRegressiveSpeculator defines propose(); EagleSpeculator (EAGLE3 path),
+# MTPSpeculator (single-layer MTP, incl. Nemotron nemotron_h_mtp), and
+# Gemma4Speculator all inherit it without overriding, so patching
+# AutoRegressiveSpeculator covers all three.
+# DFlashSpeculator defines propose(); DFlash2Speculator and DSparkSpeculator
+# inherit it without overriding, so patching DFlashSpeculator covers both.
+# MultiModuleMTPSpeculator (multi-layer MTP, selected instead of
+# MTPSpeculator when the draft model has >1 MTP layer and
+# num_speculative_tokens > 1 -- see SpeculativeConfig.use_multi_module_mtp)
+# overrides propose() itself and needs its own entry.
 _DRAFT_TARGETS = (
     ("vllm.v1.spec_decode.ngram_proposer", "NgramProposer"),
     ("vllm.v1.spec_decode.medusa", "MedusaProposer"),
@@ -67,6 +111,15 @@ _DRAFT_TARGETS = (
     ("vllm.v1.spec_decode.ngram_proposer_gpu", "NgramProposerGPU"),
     ("vllm.v1.spec_decode.suffix_decoding", "SuffixDecodingProposer"),
     ("vllm.v1.spec_decode.step3p5", "Step3p5MTPProposer"),
+    (
+        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
+        "AutoRegressiveSpeculator",
+    ),
+    ("vllm.v1.worker.gpu.spec_decode.dflash.speculator", "DFlashSpeculator"),
+    (
+        "vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator",
+        "MultiModuleMTPSpeculator",
+    ),
 )
 
 # Module-level snapshot of the most recent register() call, so report() can
@@ -250,7 +303,8 @@ def register() -> dict:
         _patch_model_runner(module_name, class_name, patched, errors)
 
     for module_name, class_name in _DRAFT_TARGETS:
-        label = f"DRAFT:{class_name}.propose"
+        qualified = f"{module_name}.{class_name}"
+        label = f"DRAFT:{qualified}.propose"
         try:
             module = importlib.import_module(module_name)
             cls = getattr(module, class_name)
