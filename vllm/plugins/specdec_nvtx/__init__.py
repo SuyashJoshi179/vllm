@@ -15,10 +15,28 @@ ranges so that an Nsight Systems trace can be attributed to decode phases:
 DRAFT ranges nest inside SAMPLE (drafting happens during sample_tokens) and
 both are siblings of VERIFY/PREFILL_STEP. VERIFY does NOT contain DRAFT.
 
+vLLM v0.28.0 ships TWO model runners named `GPUModelRunner` in different
+modules:
+
+    vllm.v1.worker.gpu_model_runner:GPUModelRunner       (V1)
+    vllm.v1.worker.gpu.model_runner:GPUModelRunner       (V2)
+
+`vllm/v1/worker/gpu_worker.py` picks between them at runtime based on
+`self.use_v2_model_runner` (VLLM_USE_V2_MODEL_RUNNER + heuristics), and on
+some hardware/configs V2 is what actually executes. Patching only V1 means
+`report()` can truthfully say "patched" while the class that runs every
+request was never touched -- proven empirically by a call counter that
+stayed at zero for an entire served run. Both runners are therefore patched
+independently below; a build that only has one of them records an import
+failure in `errors` for the other rather than raising, and `report()` names
+the exact module each successful patch came from so this ambiguity cannot
+recur silently.
+
 No existing vLLM source file is modified; everything here is monkeypatching
 applied from the `vllm.general_plugins` entry point (see register() below).
 """
 
+import collections
 import functools
 import importlib
 import os
@@ -27,6 +45,15 @@ import torch
 
 _WRAPPED_ATTR = "_specdec_nvtx_wrapped"
 _RPC_INSTALLED_ATTR = "_specdec_nvtx_rpcs_installed"
+
+# Both known GPUModelRunner implementations. V1 and V2 share a class name but
+# live in different modules and are NOT the same object -- both must be
+# patched independently; a given build/config may only have one of them
+# importable, which is not an error.
+_MODEL_RUNNER_TARGETS = (
+    ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner"),   # V1
+    ("vllm.v1.worker.gpu.model_runner", "GPUModelRunner"),   # V2
+)
 
 # Proposer classes that expose a `propose()` method to wrap with DRAFT.
 # SpecDecodeBaseProposer is the shared base for the LLM-based drafters
@@ -45,6 +72,15 @@ _DRAFT_TARGETS = (
 # Module-level snapshot of the most recent register() call, so report() can
 # be called standalone (e.g. via the worker RPC) without re-running patching.
 _state: dict = {"patched": [], "errors": []}
+
+# Permanent (not debug-gated) evidence that instrumentation is actually
+# EXECUTING, not merely installed. Keyed by range name (VERIFY,
+# PREFILL_STEP, SAMPLE, DRAFT). A dict increment per decode step is
+# negligible next to milliseconds of GPU work, and this counter is the only
+# direct proof the harness has that a wrapped method was ever called -- the
+# whole point of Defect: patching silently landed on the wrong class and
+# nothing surfaced it. This must never be optional.
+_call_counts: "collections.Counter[str]" = collections.Counter()
 
 
 def _has_prefill(scheduler_output) -> bool:
@@ -74,6 +110,7 @@ def _make_execute_model_wrapper(orig):
     @functools.wraps(orig)
     def wrapper(self, scheduler_output, *args, **kwargs):
         range_name = "PREFILL_STEP" if _has_prefill(scheduler_output) else "VERIFY"
+        _call_counts[range_name] += 1
         torch.cuda.nvtx.range_push(range_name)
         try:
             return orig(self, scheduler_output, *args, **kwargs)
@@ -87,6 +124,7 @@ def _make_execute_model_wrapper(orig):
 def _make_static_range_wrapper(orig, range_name: str):
     @functools.wraps(orig)
     def wrapper(*args, **kwargs):
+        _call_counts[range_name] += 1
         torch.cuda.nvtx.range_push(range_name)
         try:
             return orig(*args, **kwargs)
@@ -124,6 +162,38 @@ def _patch_method(cls, method_name, make_wrapper, label, patched, errors) -> boo
         return False
 
 
+def _patch_model_runner(module_name, class_name, patched, errors) -> None:
+    """Attempt to patch one GPUModelRunner implementation. Import failure is
+    recorded, not raised -- a given build/config may only ship one of V1/V2,
+    and that alone is not a defect."""
+    try:
+        module = importlib.import_module(module_name)
+        cls = getattr(module, class_name)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(
+            f"{module_name}.{class_name}: import failed: {type(exc).__name__}: {exc}"
+        )
+        return
+
+    qualified = f"{module_name}.{class_name}"
+    _patch_method(
+        cls,
+        "execute_model",
+        _make_execute_model_wrapper,
+        f"VERIFY/PREFILL_STEP:{qualified}.execute_model",
+        patched,
+        errors,
+    )
+    _patch_method(
+        cls,
+        "sample_tokens",
+        lambda orig: _make_static_range_wrapper(orig, "SAMPLE"),
+        f"SAMPLE:{qualified}.sample_tokens",
+        patched,
+        errors,
+    )
+
+
 def install_worker_rpcs(worker_cls) -> None:
     """Attach collective_rpc-callable helpers to the vLLM Worker class.
 
@@ -151,7 +221,14 @@ def install_worker_rpcs(worker_cls) -> None:
 
 
 def report() -> dict:
-    """Return the current instrumentation status for this process."""
+    """Return the current instrumentation status for this process.
+
+    `call_counts` is the permanent evidence that patched methods actually
+    ran -- not just that patching succeeded -- keyed by range name
+    (VERIFY, PREFILL_STEP, SAMPLE, DRAFT). It is never gated behind a debug
+    flag: the original defect here was precisely that this evidence was
+    optional.
+    """
     patched = list(_state["patched"])
     errors = list(_state["errors"])
     ok = any(p.startswith("DRAFT:") for p in patched)
@@ -160,6 +237,7 @@ def report() -> dict:
         "patched": patched,
         "errors": errors,
         "ok": ok,
+        "call_counts": dict(_call_counts),
     }
 
 
@@ -168,24 +246,8 @@ def register() -> dict:
     patched: list = []
     errors: list = []
 
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-    _patch_method(
-        GPUModelRunner,
-        "execute_model",
-        _make_execute_model_wrapper,
-        "VERIFY/PREFILL_STEP:GPUModelRunner.execute_model",
-        patched,
-        errors,
-    )
-    _patch_method(
-        GPUModelRunner,
-        "sample_tokens",
-        lambda orig: _make_static_range_wrapper(orig, "SAMPLE"),
-        "SAMPLE:GPUModelRunner.sample_tokens",
-        patched,
-        errors,
-    )
+    for module_name, class_name in _MODEL_RUNNER_TARGETS:
+        _patch_model_runner(module_name, class_name, patched, errors)
 
     for module_name, class_name in _DRAFT_TARGETS:
         label = f"DRAFT:{class_name}.propose"
